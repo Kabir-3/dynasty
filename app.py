@@ -32,6 +32,18 @@ def _clear_prod_cache():
     except Exception:
         pass
 
+# Small helper to be compatible with older/newer pandas groupby.apply behavior
+def group_apply(gb, func):
+    """
+    Call GroupBy.apply(func) in a way that works across pandas versions
+    where include_groups was added (FutureWarning otherwise).
+    """
+    try:
+        return gb.apply(func, include_groups=False)
+    except TypeError:
+        # pandas <= 2.2 (no include_groups kwarg)
+        return gb.apply(func)
+
 # ---------------- Session defaults ----------------
 if "league_id" not in st.session_state:
     st.session_state.league_id = "1195252934627844096"
@@ -222,7 +234,8 @@ def get_sleeper_state() -> dict:
         return {}
 
 def default_season_and_week() -> Tuple[int, int]:
-    now = dt.datetime.utcnow()
+    # timezone-aware to avoid deprecation warning
+    now = dt.datetime.now(dt.timezone.utc)
     state = get_sleeper_state()
     season = int(state.get("season") or now.year)
     week = int(state.get("week") or 1)
@@ -248,7 +261,7 @@ def get_league_meta(league_id: str) -> dict:
 MATCHUPS = "https://api.sleeper.app/v1/league/{league_id}/matchups/{week}"
 
 # Map past seasons to their league_id (fill these if you want to browse old seasons)
-PAST_LEAGUES: dict[int, str] = {
+PAST_LEAGUES: Dict[int, str] = {
     # 2024: "YOUR_2024_LEAGUE_ID",
     # 2023: "YOUR_2023_LEAGUE_ID",
 }
@@ -276,13 +289,7 @@ def fetch_matchups_week(league_id: str, week: int) -> pd.DataFrame:
             if not name or not pos:
                 continue
             rows.append(
-                {
-                    "player_id": pid,
-                    "name": name,
-                    "pos": pos,
-                    "week": int(week),
-                    "points": float(pts or 0.0),
-                }
+                {"player_id": pid, "name": name, "pos": pos, "week": int(week), "points": float(pts or 0.0)}
             )
 
     out = pd.DataFrame(rows)
@@ -390,8 +397,8 @@ def fetch_sleeper_points_ppr(season: int, through_week: int) -> Tuple[pd.DataFra
     return t, w, meta
 
 # ---------------- Win-Now controls ----------------
-weekly_df = None
-meta_fetch = {}
+weekly_df: Optional[pd.DataFrame] = None
+meta_fetch: Dict[str, object] = {}
 if mode.startswith("Win"):
     st.subheader("Win-Now production (auto from Sleeper)")
     league_meta = get_league_meta(st.session_state["league_id"])
@@ -653,23 +660,30 @@ def is_prime_age(row) -> bool:
     return 23 <= a <= 28
 
 # ---- Win-Now feature engineering ----
+
+# Games Played (robust merge by player_id else name_key)
 if weekly_df is not None and not weekly_df.empty:
-    games = weekly_df.groupby("player_id" if "player_id" in weekly_df.columns else ["name_key", "pos"])["week"].nunique()
-    if "player_id" in weekly_df.columns and "player_id" in df.columns:
-        df["games_played"] = df["player_id"].map(games).fillna(0)
+    w = weekly_df.copy()
+    if "name_key" not in w.columns and "name" in w.columns:
+        w["name_key"] = normalize_name(w["name"])
+    if "name_key" not in df.columns and "name" in df.columns:
+        df["name_key"] = normalize_name(df["name"])
+
+    use_pid = ("player_id" in w.columns) and ("player_id" in df.columns)
+
+    if use_pid:
+        g = w.groupby("player_id")["week"].nunique().rename("games").reset_index()
+        df = df.merge(g.rename(columns={"games": "_gp_tmp"}), on="player_id", how="left")
     else:
-        g2 = games.reset_index().rename(columns={"week": "games"})
-        df = df.merge(
-            g2.rename(columns={"games": "_gp_tmp"}),
-            left_on=["name_key", "pos"],
-            right_on=["name_key", "pos"],
-            how="left",
-        )
-        df["games_played"] = df["_gp_tmp"].fillna(0)
-        df.drop(columns=["_gp_tmp"], inplace=True, errors="ignore")
+        g = w.groupby(["name_key", "pos"])["week"].nunique().rename("games").reset_index()
+        df = df.merge(g.rename(columns={"games": "_gp_tmp"}), on=["name_key", "pos"], how="left")
+
+    df["games_played"] = df["_gp_tmp"].fillna(0)
+    df.drop(columns=["_gp_tmp"], inplace=True, errors="ignore")
 else:
     df["games_played"] = np.nan
 
+# PPG
 df["ppg"] = df.apply(
     lambda r: (r["points_total"] / r["games_played"])
     if pd.notna(r.get("points_total")) and r.get("games_played", 0) > 0
@@ -677,47 +691,47 @@ df["ppg"] = df.apply(
     axis=1,
 )
 
+# EWMA (recent form)
 if weekly_df is not None and not weekly_df.empty:
     w = weekly_df.copy()
+    if "name_key" not in w.columns and "name" in w.columns:
+        w["name_key"] = normalize_name(w["name"])
     key = "player_id" if ("player_id" in w.columns and "player_id" in df.columns) else "name_key"
 
     def ewma_grp(g, alpha=0.6):
-        x = pd.to_numeric(g["points"], errors="coerce").fillna(0.0).values
+        x = pd.to_numeric(g.sort_values("week")["points"], errors="coerce").fillna(0.0).values
         if len(x) == 0:
             return 0.0
         wts = np.array([(1 - alpha) ** i for i in range(len(x) - 1, -1, -1)], dtype=float)
         wts /= wts.sum()
         return float(np.dot(x, wts))
 
-    ew = (
-        w.sort_values(["week"])
-        .groupby([key, "pos"], as_index=False)
-        .apply(lambda g: ewma_grp(g))
-        .rename(columns={None: "ewma"})
-    )
+    cewma = group_apply(w.sort_values("week").groupby([key, "pos"]), ewma_grp).rename("ewma").reset_index()
     if key == "player_id":
-        df = df.merge(ew[[key, "pos", "ewma"]], on=[key, "pos"], how="left")
+        df = df.merge(cewma, on=["player_id", "pos"], how="left")
     else:
-        df = df.merge(ew[[key, "pos", "ewma"]], left_on=["name_key", "pos"], right_on=[key, "pos"], how="left")
-        df.drop(columns=["name_key_y"], inplace=True, errors="ignore")
-        df.rename(columns={"name_key_x": "name_key"}, inplace=True, errors="ignore")
+        df = df.merge(cewma, on=["name_key", "pos"], how="left")
 else:
     df["ewma"] = np.nan
 
+# Trend
 df["trend"] = df["ewma"] - df["ppg"]
 
+# Consistency (std over last 4)
 if weekly_df is not None and not weekly_df.empty:
     w = weekly_df.copy()
+    if "name_key" not in w.columns and "name" in w.columns:
+        w["name_key"] = normalize_name(w["name"])
+    key = "player_id" if ("player_id" in w.columns and "player_id" in df.columns) else "name_key"
 
     def last4_std(g):
         x = pd.to_numeric(g.sort_values("week")["points"].tail(4), errors="coerce")
         return float(x.std(ddof=0)) if len(x) > 1 else np.nan
 
-    if "player_id" in w.columns and "player_id" in df.columns:
-        cstd = w.groupby(["player_id", "pos"]).apply(last4_std).rename("std4").reset_index()
+    cstd = group_apply(w.groupby([key, "pos"]), last4_std).rename("std4").reset_index()
+    if key == "player_id":
         df = df.merge(cstd, on=["player_id", "pos"], how="left")
     else:
-        cstd = w.groupby(["name_key", "pos"]).apply(last4_std).rename("std4").reset_index()
         df = df.merge(cstd, on=["name_key", "pos"], how="left")
 else:
     df["std4"] = np.nan
