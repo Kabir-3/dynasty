@@ -120,7 +120,7 @@ def compute_true_value(
     for c in ("name","pos"):
         if c not in df.columns:
             raise ValueError(f"compute_true_value missing column: {c}")
-    passthru = [c for c in ["display_name","team"] if c in df.columns]
+    passthru = [c for c in ["display_name","team","player_id","sleeper_id","id"] if c in df.columns]
 
     df["pos"] = df["pos"].astype(str)
     df["age"] = pd.to_numeric(df.get("age", np.nan), errors="coerce")
