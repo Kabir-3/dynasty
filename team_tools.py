@@ -172,4 +172,3 @@ def quick_balance_score(send_df: pd.DataFrame, recv_df: pd.DataFrame):
     denom = max(1.0, s_total + r_total)
     score = 1.0 - min(1.0, abs(diff) / denom)
     return s_total, r_total, diff, score
-
