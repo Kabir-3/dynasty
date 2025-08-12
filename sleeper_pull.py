@@ -52,4 +52,3 @@ if __name__ == "__main__":
     print(df.head(12))
     df.to_csv("league_rosters.csv", index=False)
     print("Saved league_rosters.csv")
-
