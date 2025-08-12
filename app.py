@@ -287,27 +287,32 @@ def fetch_sleeper_adp() -> Optional[pd.DataFrame]:
         return None if df.empty else df
     except Exception:
         return None
-
 def dp_to_market(dp: pd.DataFrame) -> pd.DataFrame:
     df = dp.copy()
-    name_candidates = ["name", "player_name", "player", "Player", "full_name", "Player Name"]
-    pos_candidates = ["pos", "position", "Position"]
-
-    def pick(cands: Iterable[str]) -> Optional[str]:
+    name_candidates = ["name","player_name","player","Player","full_name","Player Name"]
+    pos_candidates  = ["pos","position","Position"]
+    def pick(cands): 
         for c in cands:
-            if c in df.columns:
-                return c
+            if c in df.columns: return c
         return None
-
-    name_col = pick(name_candidates)
-    pos_col = pick(pos_candidates)
+    name_col = pick(name_candidates); pos_col = pick(pos_candidates)
     if name_col is None or pos_col is None:
         raise RuntimeError(f"Missing name/pos in DP CSV. Saw: {list(df.columns)}")
     value_cols = [c for c in df.columns if ("_1qb" in c.lower()) or ("value" in c.lower())]
     if not value_cols:
         raise RuntimeError(f"No value columns in DP CSV. Saw: {list(df.columns)}")
+
     mv = df[value_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
-    return pd.DataFrame({"name": df[name_col].astype(str), "pos": df[pos_col].astype(str), "market_value": mv})
+
+    # normalize here
+    name = df[name_col].astype(str)
+    pos  = df[pos_col].astype(str).str.upper().str.strip()
+
+    # also trim/condense whitespace in name
+    name = name.str.replace(r"\s+", " ", regex=True).str.strip()
+
+    return pd.DataFrame({"name": name, "pos": pos, "market_value": mv})
+
 
 @st.cache_data(ttl=2 * 60 * 60)
 def get_sleeper_state() -> dict:
