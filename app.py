@@ -8,10 +8,87 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+from math import exp
+from collections import defaultdict
+from lineup_optimizer import (
+    LineupConfig,
+    default_config,
+    make_config,
+    project_points_this_week,
+    recommend_lineup_with_cfg,
+    bench_swap_suggestions,
+    prepare_fa_pool,
+    fa_upgrade_suggestions,
+)
+
 
 from sleeper_pull import fetch_league_data
 from value_engine import compute_true_value, attach_markets
 from team_tools import quick_balance_score
+
+# ---------- Action Plan helpers ----------
+
+def _proj_variance_defaults():
+    # conservative weekly SDs by position, if we can't learn from data
+    return {"QB": 5.0, "RB": 4.5, "WR": 4.0, "TE": 3.5, "K": 3.0}
+
+def learn_position_sd(weekly_df: pd.DataFrame) -> Dict[str, float]:
+    if weekly_df is None or weekly_df.empty or "pos" not in weekly_df.columns:
+        return _proj_variance_defaults()
+    w = weekly_df.copy()
+    w["points"] = pd.to_numeric(w["points"], errors="coerce").fillna(0.0)
+    sd = w.groupby("pos")["points"].std(ddof=0).to_dict()
+    base = _proj_variance_defaults()
+    # blend learned with defaults
+    return {p: float(np.nan_to_num(sd.get(p, base[p]))*0.7 + base[p]*0.3) for p in base}
+
+def weakest_starters(starters_df: pd.DataFrame, k: int = 3) -> pd.DataFrame:
+    if starters_df is None or starters_df.empty:
+        return starters_df.iloc[0:0]
+    cols = [c for c in ["slot","name","pos","proj_week"] if c in starters_df.columns]
+    return starters_df.sort_values("proj_week", ascending=True)[cols].head(k)
+
+def top_fa_upgrades(starters_df, fa_mkt, lineup_cfg, pos_prior, min_delta=0.5, max_results=5):
+    # score FA pool using same projection function (offseason-safe)
+    fa_scored = project_points_this_week(
+        fa_mkt.assign(ewma=np.nan, ppg=np.nan, trend=np.nan, games_played=np.nan),
+        pos_prior=pos_prior
+    )
+    # cap crazy off-season fallbacks a bit
+    no_signal = fa_scored[["ewma","ppg"]].fillna(0).sum(axis=1).eq(0)
+    pos_cap = {"QB": 8.0, "RB": 8.0, "WR": 7.0, "TE": 6.0, "K": 8.0}
+    def _cap_row(r):
+        cap = pos_cap.get(str(r.get("pos")), 6.0)
+        return min(float(r.get("proj_week", 0.0)) * 0.65, cap)
+    fa_scored.loc[no_signal, "proj_week"] = fa_scored.loc[no_signal].apply(_cap_row, axis=1)
+
+    return fa_upgrade_suggestions(starters_df, fa_scored, lineup_cfg, min_delta=min_delta, max_results=max_results)
+
+def breakout_stashes(my_df: pd.DataFrame, weekly_df: pd.DataFrame, limit: int = 5) -> pd.DataFrame:
+    """
+    Simple stash heuristic: positive trend, EWMA > PPG, price percentile <= 0.60 (cheap),
+    not already in top starters.
+    """
+    x = my_df.copy()
+    if x.empty:
+        return x.iloc[0:0]
+    # ensure these exist
+    for c in ["trend","ewma","ppg","price_pct"]:
+        if c not in x.columns:
+            x[c] = np.nan
+    # fill safety
+    x["price_pct"] = pd.to_numeric(x["price_pct"], errors="coerce").fillna(0.5)
+    x["trend"] = pd.to_numeric(x["trend"], errors="coerce").fillna(0.0)
+    x["ewma"] = pd.to_numeric(x["ewma"], errors="coerce").fillna(0.0)
+    x["ppg"]  = pd.to_numeric(x["ppg"],  errors="coerce").fillna(0.0)
+
+    cand = x[(x["trend"] > 0) & (x["ewma"] > x["ppg"]) & (x["price_pct"] <= 0.60)].copy()
+    # upside score: trend + ewma surplus, break ties by lower price
+    cand["stash_score"] = (cand["trend"]*0.6 + (cand["ewma"]-cand["ppg"])*0.4) - (cand["price_pct"]*0.2)
+    keep = [c for c in ["name","pos","team","ppg","ewma","trend","price_pct","stash_score"] if c in cand.columns]
+    return cand.sort_values("stash_score", ascending=False)[keep].head(limit)
+
+
 
 # ---------------- App setup ----------------
 st.set_page_config(page_title="Dynasty Buy/Sell Radar", layout="wide")
@@ -137,7 +214,13 @@ with c3:
     w_fp = st.slider("Weight: ADP fallback", 0.0, 1.0, 0.3, 0.05)
 ppr = scoring_choice == "PPR"
 
-mode = st.radio("Evaluation mode", ["Market Edge", "Win-Now (auto from Sleeper)"], horizontal=True)
+mode = st.radio(
+    "Evaluation mode",
+    ["Market Edge", "Win-Now (auto from Sleeper)", "Lineup Optimizer"],
+    horizontal=True,
+)
+
+
 
 # ---------------- External sources ----------------
 DP_URL = "https://raw.githubusercontent.com/dynastyprocess/data/master/files/values-players.csv"
@@ -449,6 +532,30 @@ if mode.startswith("Win"):
     else:
         st.info(f"Using season **{meta_fetch['season_used']}** ({meta_fetch['source']}).")
 
+# ---------------- Mode-specific weekly production fetch ----------------
+# Win-Now already fetched weekly_df above using the user’s season/week controls.
+# Only fetch here for Lineup Optimizer; leave Market Edge with no weekly_df.
+if mode == "Lineup Optimizer":
+    weekly_df = None
+    meta_fetch = {}
+    league_meta = get_league_meta(st.session_state["league_id"])
+    now_season, now_week = default_season_and_week()
+    season = int(league_meta.get("season") or now_season)
+    through_week = int(now_week)
+    with st.spinner(f"Fetching production (matchups) for lineup optimizer…"):
+        league_for = st.session_state["league_id"]
+        _, weekly_df = fetch_points_season_to_date_via_matchups(league_for, through_week)
+    meta_fetch = {
+        "season_used": season,
+        "weeks_used": list(range(1, through_week + 1)),
+        "source": "matchups",
+    }
+elif mode == "Market Edge":
+    weekly_df = None
+    meta_fetch = {}
+# (when mode starts with "Win", DO NOT touch weekly_df/meta_fetch here — the earlier block controls it)
+
+
 # ---------------- Load league + markets ----------------
 @st.cache_data(ttl=24 * 60 * 60)
 def load_all(
@@ -565,6 +672,166 @@ def zscore(s: pd.Series) -> pd.Series:
         return pd.Series(0.0, index=s.index, dtype=float)
     return (s - mu) / sd
 
+# ---------- Playoff Odds helpers ----------
+@st.cache_data(ttl=2*60*60)
+def _fetch_owner_maps(league_id: str):
+    """Map roster_id -> display_name and back. Used to translate Sleeper matchups to team names."""
+    try:
+        users = requests.get(f"https://api.sleeper.app/v1/league/{league_id}/users", timeout=20).json()
+        rosters = requests.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters", timeout=20).json()
+    except Exception:
+        return {}, {}, {}
+
+    uid_to_name = {u.get("user_id"): (u.get("display_name") or f"user_{u.get('user_id')}") for u in users or []}
+    rid_to_uid  = {r.get("roster_id"): r.get("owner_id") for r in rosters or []}
+    rid_to_name = {rid: uid_to_name.get(uid, f"owner_{uid}") for rid, uid in rid_to_uid.items()}
+
+    # name -> roster_id (useful for resolving)
+    name_to_rid = {}
+    for rid, uid in rid_to_uid.items():
+        nm = uid_to_name.get(uid)
+        if nm:
+            name_to_rid[nm] = rid
+    return rid_to_name, name_to_rid, rosters
+
+@st.cache_data(ttl=2*60*60)
+def _fetch_schedule_pairs(league_id: str, start_week: int, end_week: int):
+    """
+    Returns: {week: [(nameA, nameB), ...]}, using current season league schedule via /matchups/{week}.
+    """
+    rid_to_name, _, _ = _fetch_owner_maps(league_id)
+    schedule = {}
+    for wk in range(int(start_week), int(end_week) + 1):
+        try:
+            data = requests.get(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{wk}", timeout=30).json()
+        except Exception:
+            data = None
+        if not data:
+            schedule[wk] = []
+            continue
+        # group by matchup_id then pair the two rosters
+        buckets = defaultdict(list)
+        for row in data:
+            buckets[row.get("matchup_id")].append(row)
+        pairs = []
+        for mid, rows in buckets.items():
+            names = []
+            for r in rows:
+                rid = r.get("roster_id")
+                nm = rid_to_name.get(rid)
+                if nm:
+                    names.append(nm)
+            if len(names) == 2:
+                pairs.append((names[0], names[1]))
+        schedule[wk] = pairs
+    return schedule
+
+def _team_ratings_from_df(df: pd.DataFrame, metric: str = "z_prod") -> Dict[str, float]:
+    """Use your existing strength_table totals as a rating baseline."""
+    tbl = strength_table(df, metric)
+    # Normalize to ~N(0,1) just in case
+    r = tbl["TOTAL"]
+    mu, sd = r.mean(), r.std(ddof=0) or 1.0
+    return {team: float((val - mu) / sd) for team, val in r.items()}
+
+def _win_prob(r_a: float, r_b: float, k: float = 0.9) -> float:
+    """Logistic on rating diff → win probability for A vs B."""
+    return 1.0 / (1.0 + exp(-k * (r_a - r_b)))
+
+def simulate_playoff_odds(
+    df: pd.DataFrame,
+    league_id: str,
+    start_week: int,
+    end_week: int,
+    playoff_teams: int,
+    metric_for_ratings: str = "z_prod",
+    sims: int = 2000,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """
+    Monte Carlo using schedule + rating-based win probs.
+    Returns: {display_name: playoff_odds_float_between_0_and_1}
+    """
+    import random
+    random.seed(int(seed))
+
+    teams = sorted(df["display_name"].dropna().unique().tolist())
+    if not teams:
+        return {}
+    ratings = _team_ratings_from_df(df, metric_for_ratings)
+    schedule = _fetch_schedule_pairs(league_id, start_week, end_week)
+
+    counts = {t: 0 for t in teams}     # # of simulations where team makes playoffs
+    for _ in range(int(sims)):
+        wins = {t: 0 for t in teams}
+        for wk in range(int(start_week), int(end_week) + 1):
+            for (a, b) in schedule.get(wk, []):
+                if (a not in ratings) or (b not in ratings):
+                    continue
+                p = _win_prob(ratings[a], ratings[b])
+                if random.random() < p:
+                    wins[a] += 1
+                else:
+                    wins[b] += 1
+        # top-N by wins make playoffs (random tiebreaker)
+        ordered = sorted(teams, key=lambda t: (wins[t], random.random()), reverse=True)
+        qualifiers = set(ordered[:int(playoff_teams)])
+        for t in qualifiers:
+            counts[t] += 1
+
+    return {t: counts[t] / float(sims) for t in teams}
+
+def compute_playoff_window(meta: dict):
+    """Figure out remaining regular-season weeks from league meta."""
+    now_season, now_week = default_season_and_week()
+    settings = (meta or {}).get("settings") or {}
+    start = max(int(now_week), 1)
+    # Sleeper commonly has 'playoff_week_start'
+    end = int(settings.get("playoff_week_start") or (start + 3))
+    playoff_teams = int(settings.get("playoff_teams") or 6)
+    # clamp
+    end = max(end - 1, start)  # simulate regular season up to the week before playoffs
+    return start, end, playoff_teams
+
+
+
+def build_weekly_action_plan(swaps: pd.DataFrame, fa_up: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    rows = []
+
+    # ---- Bench swaps (strict schema expected) ----
+    if isinstance(swaps, pd.DataFrame) and not swaps.empty:
+        need = {"slot", "starter", "candidate", "delta_pts"}
+        if need.issubset(set(swaps.columns)):
+            for _, r in swaps.sort_values("delta_pts", ascending=False).iterrows():
+                rows.append({
+                    "Priority": "Start/Sit",
+                    "Action": f"Swap in {r['candidate']} for {r['starter']} at {r['slot']}",
+                    "Delta (pts)": round(float(r["delta_pts"]), 2),
+                })
+
+    # ---- FA upgrades (be flexible on column names) ----
+    if isinstance(fa_up, pd.DataFrame) and not fa_up.empty:
+        # Try multiple possible column names to be robust across versions
+        cand_col  = next((c for c in ["candidate", "add", "player", "name"]        if c in fa_up.columns), None)
+        repl_col  = next((c for c in ["replaced", "starter", "over", "drop"]       if c in fa_up.columns), None)
+        slot_col  = next((c for c in ["slot", "pos", "position"]                   if c in fa_up.columns), None)
+        delta_col = next((c for c in ["delta_pts", "delta", "gain", "improvement"] if c in fa_up.columns), None)
+
+        if all([cand_col, repl_col, slot_col, delta_col]):
+            for _, r in fa_up.sort_values(delta_col, ascending=False).iterrows():
+                rows.append({
+                    "Priority": "FA Upgrade",
+                    "Action": f"Add {r[cand_col]} and start over {r[repl_col]} at {r[slot_col]}",
+                    "Delta (pts)": round(float(r[delta_col]), 2),
+                })
+
+    if not rows:
+        return pd.DataFrame([{"Priority": "Info", "Action": "No actionable moves this week", "Delta (pts)": 0.0}])
+
+    out = pd.DataFrame(rows).sort_values(["Delta (pts)", "Priority"], ascending=[False, True], ignore_index=True)
+    return out
+
+
 def strength_table(df_all: pd.DataFrame, metric_col: str) -> pd.DataFrame:
     x = df_all.copy()
     if metric_col == "z_mkt":
@@ -582,6 +849,170 @@ def strength_table(df_all: pd.DataFrame, metric_col: str) -> pd.DataFrame:
     pivot = pivot[["QB", "RB", "WR", "TE", "K"]]
     pivot["TOTAL"] = pivot[["QB", "RB", "WR", "TE", "K"]].sum(axis=1)
     return pivot.sort_values("TOTAL", ascending=False).round(4)
+
+
+from collections import Counter
+
+# -------- Robust league roster index + FA filter (shared) --------
+def _tokens_loose(s: str) -> set:
+    s = "".join(ch if ch.isalnum() or ch == " " else " " for ch in (s or "").lower())
+    toks = [t for t in s.split() if t and t not in {"jr","sr","ii","iii","iv","v"}]
+    return set(toks)
+
+def _lf_key(name: str) -> str:
+    # last-name + first-initial, e.g. "brown_m" for Marquise Brown
+    parts = [p for p in (name or "").strip().split() if p]
+    if not parts: 
+        return ""
+    last = parts[-1].lower()
+    first_init = parts[0][0].lower() if parts[0] else ""
+    return f"{last}_{first_init}"
+
+def build_league_roster_index(df_all: pd.DataFrame):
+    """Return a dict by pos with exact name_keys, fuzzy token sets, and last+firstInitial keys."""
+    roster = df_all[["name","pos"]].dropna().copy()
+    roster["name_key"] = normalize_name(roster["name"])
+    roster["lfk"] = roster["name"].astype(str).apply(_lf_key)
+    out = {}
+    for p, grp in roster.groupby("pos"):
+        exact = set(grp["name_key"].unique().tolist())
+        lfk = set(grp["lfk"].unique().tolist())
+        fuzz = [_tokens_loose(nk) for nk in grp["name_key"].unique()]
+        out[p] = {"exact": exact, "lfk": lfk, "fuzz": fuzz}
+    return out
+
+def filter_unrostered(dp_market: pd.DataFrame, roster_index: dict, fuzzy_thresh: float = 0.80) -> pd.DataFrame:
+    """dp_market: columns name,pos,market_value. Removes anyone who looks rostered in this league."""
+    if dp_market is None or dp_market.empty:
+        return pd.DataFrame(columns=["name","pos","market_value"])
+    m = dp_market.copy()
+    m = m[m["pos"].isin(["QB","RB","WR","TE","K"])].copy()
+    m["name_key"] = normalize_name(m["name"])
+    m["lfk"] = m["name"].astype(str).apply(_lf_key)
+
+    def is_rostered(row):
+        pos = row["pos"]
+        nk = row["name_key"]
+        lfk = row["lfk"]
+        idx = roster_index.get(pos, {})
+        # exact name_key or last+firstInitial
+        if nk in idx.get("exact", set()) or lfk in idx.get("lfk", set()):
+            return True
+        # fuzzy tokens (to catch nicknames/accents)
+        toks = _tokens_loose(nk)
+        for tset in idx.get("fuzz", []):
+            if not toks or not tset:
+                continue
+            inter = len(toks & tset); uni = len(toks | tset)
+            if uni and (inter / uni) >= fuzzy_thresh:
+                return True
+        return False
+
+    mask = m.apply(is_rostered, axis=1)
+    return m[~mask].drop(columns=["name_key","lfk"])
+
+
+
+def detect_lineup_config_from_sleeper(league_id: str) -> LineupConfig:
+    meta = get_league_meta(league_id) or {}
+    rpos = meta.get("roster_positions") or []   # e.g., ["QB","RB","RB","WR","WR","TE","FLEX","SUPER_FLEX","K","BN",...]
+    c = Counter(rpos)
+
+    qb = c.get("QB", 1)
+    rb = c.get("RB", 2)
+    wr = c.get("WR", 2)
+    te = c.get("TE", 1)
+    k  = c.get("K", 0)
+    flex = c.get("FLEX", 0)          # RB/WR/TE
+    sflex = c.get("SUPER_FLEX", 0)   # QB/RB/WR/TE
+
+    ss = meta.get("scoring_settings") or {}
+    rec = float(ss.get("rec", 0.0) or 0.0)
+    rec_te = float(ss.get("rec_te", rec) or rec)
+    te_prem = rec_te > rec + 1e-9
+
+    return make_config(qb, rb, wr, te, flex, sflex, k, te_prem)
+
+def canonicalize_alias(nk: str) -> str:
+    if not nk:
+        return nk
+    toks = nk.split()
+    s = set(toks)
+    if "brown" in s and "hollywood" in s:
+        toks = [t for t in toks if t != "hollywood"]
+        if "marquise" not in toks:
+            toks = ["marquise"] + toks
+    return " ".join(toks)
+
+
+def build_roster_safe_fa_pool(dp_market: pd.DataFrame, league_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return DP market rows that are NOT rostered anywhere in this league,
+    using exact + alias-canonicalized keys and a fuzzy guard.
+    Output: ['name','pos','market_value']  (empty-safe)
+    """
+    if dp_market is None or dp_market.empty or league_df is None or league_df.empty:
+        return pd.DataFrame(columns=["name","pos","market_value"])
+
+    # 1) DP subset + normalized+canonicalized key
+    m = dp_market.copy()
+    m = m[m["pos"].isin(["QB","RB","WR","TE","K"])].copy()
+    m["name_key"] = normalize_name(m["name"]).apply(canonicalize_alias)
+
+    # 2) league-wide roster keys (normalized+canonicalized)
+    roster_keys = league_df[["name","pos"]].dropna().copy()
+    roster_keys["name_key"] = normalize_name(roster_keys["name"]).apply(canonicalize_alias)
+    roster_keys = roster_keys[["pos","name_key"]].drop_duplicates()
+
+    # 3) exact anti-join by (pos, name_key)
+    exact = m.merge(roster_keys, on=["pos","name_key"], how="left", indicator=True)
+    exact = exact[exact["_merge"] == "left_only"].drop(columns=["_merge"])
+
+    # 3.5) unique last-name + position guard to block alias leaks (e.g., Hollywood/Marquise)
+    def _last_from_key(nk: str) -> str:
+        parts = [p for p in (nk or "").split() if p]
+        return parts[-1] if parts else ""
+
+    _roster_last_counts = (
+        league_df[["name","pos"]].dropna().assign(
+            name_key=lambda d: normalize_name(d["name"]).apply(canonicalize_alias),
+            last=lambda d: d["name_key"].apply(_last_from_key)
+        ).groupby(["pos","last"]).size().rename("ct").reset_index()
+    )
+    _unique_last = set(_roster_last_counts.loc[_roster_last_counts["ct"] == 1, ["pos","last"]]
+                       .itertuples(index=False, name=None))
+
+    if not exact.empty:
+        exact = exact.assign(__last=exact["name_key"].apply(_last_from_key))
+        mask_conflict = exact.apply(lambda r: (r["pos"], r["__last"]) in _unique_last, axis=1)
+        exact = exact.loc[~mask_conflict].drop(columns=["__last"])
+
+    # 4) fuzzy guard — same tokens/jaccard as Market Edge
+    def jaccard_sets(a: set, b: set) -> float:
+        return 0.0 if not a or not b else len(a & b) / len(a | b)
+
+    rost_pos_map: Dict[str, List[Tuple[str, set]]] = {}
+    for p, grp in roster_keys.groupby("pos"):
+        rost_pos_map[p] = [(nk, set(tokens_for(nk))) for nk in grp["name_key"].unique()]
+
+    def looks_rostered_fuzzy(row, thresh=0.85):
+        p = row["pos"]; nk = row["name_key"]
+        toks = set(tokens_for(nk))
+        for _, toks_r in rost_pos_map.get(p, []):
+            if jaccard_sets(toks, toks_r) >= thresh:
+                return True
+        return False
+
+    if not exact.empty:
+        exact["_is_rostered_fuzzy"] = exact.apply(looks_rostered_fuzzy, axis=1)
+        fa_mkt = exact[~exact["_is_rostered_fuzzy"]].drop(columns=["_is_rostered_fuzzy"])
+    else:
+        fa_mkt = exact.copy()
+
+    # Keep only the columns we actually need downstream
+    return fa_mkt[["name","pos","market_value"]].copy()
+
+
 
 def why_player(row: pd.Series) -> str:
     bits = []
@@ -772,6 +1203,164 @@ with st.expander("Debug (merge status)", expanded=False):
         f"after fuzzy: **{debug_after}** | season_used: **{meta_fetch.get('season_used','—')}**"
     )
 
+
+# ---------------- Lineup Optimizer (3rd mode) ----------------
+if mode == "Lineup Optimizer":
+    st.header("Lineup Optimizer")
+
+    # --- Choose which team to optimize (this was missing) ---
+    teams = sorted(df["display_name"].dropna().unique().tolist())
+    if not teams:
+        st.warning("No teams found in this league.")
+        st.stop()
+    my_team = st.selectbox("Team to optimize", teams, index=0)
+    my_df = df[df["display_name"] == my_team].copy()
+    if my_df.empty:
+        st.warning("That team has no players loaded yet.")
+        st.stop()
+
+    # --- Use Sleeper league settings (slot counts + TE premium) ---
+    lineup_cfg = detect_lineup_config_from_sleeper(st.session_state["league_id"])
+
+    # Optional tiny TE prior if league has TE premium
+    te_prior = 0.5 if lineup_cfg.te_premium else 0.0
+    pos_prior = {"TE": te_prior}
+
+    # --- Recommend starters/bench using momentum projections (weekly_df-backed) ---
+    starters_df, bench_df, total_pts = recommend_lineup_with_cfg(my_df, lineup_cfg, pos_prior=pos_prior)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown(f"**Recommended Starters for {my_team}** (sum: {total_pts:.2f})")
+        st.dataframe(starters_df[["slot","name","pos","proj_week"]], use_container_width=True)
+    with c2:
+        st.markdown("**Bench**")
+        st.dataframe(bench_df[["name","pos","proj_week"]], use_container_width=True)
+
+    # --- Bench swap ideas ---
+    swaps = bench_swap_suggestions(starters_df, bench_df, lineup_cfg)
+    st.subheader("Bench Swap Suggestions")
+    st.dataframe(swaps, use_container_width=True)
+
+        # --- Roster-safe FA pool (league-wide) ---
+    st.subheader("Free-Agent Upgrades")
+    fa_mkt = build_roster_safe_fa_pool(dp_mkt, df)  # robust anti-dup filter using full league df
+    if fa_mkt is None or fa_mkt.empty:
+        st.caption("No free agents (per DP) after roster-safe filtering.")
+    else:
+        # Score FAs with the same projection function (offseason fallback will kick in if needed)
+        fa_scored = project_points_this_week(
+            fa_mkt.assign(ewma=np.nan, ppg=np.nan, trend=np.nan, games_played=np.nan),
+            pos_prior=pos_prior
+        )
+
+        # Cap “offseason” fallbacks by position so randos don’t project like studs
+        fa_scored = fa_scored.copy()
+        no_signal = fa_scored[["ewma","ppg"]].fillna(0).sum(axis=1).eq(0)
+        pos_cap = {"QB": 8.0, "RB": 8.0, "WR": 7.0, "TE": 6.0, "K": 8.0}
+
+        def _cap_row(r):
+            cap = pos_cap.get(str(r.get("pos")), 6.0)
+            return min(float(r.get("proj_week", 0.0)) * 0.65, cap)
+
+        fa_scored.loc[no_signal, "proj_week"] = fa_scored.loc[no_signal].apply(_cap_row, axis=1)
+
+        # Upgrades relative to your current starters
+        # NOTE: pass lineup_cfg (avoid naming it 'cfg' to prevent accidental shadowing)
+        fa_up = fa_upgrade_suggestions(starters_df, fa_scored, lineup_cfg, min_delta=0.50, max_results=8)
+        st.dataframe(fa_up, use_container_width=True)
+
+
+    st.markdown("---")
+    st.subheader("Weekly Action Plan")
+
+    with st.expander("My Gameplan This Week", expanded=True):
+        # Current optimal lineup summary
+        st.markdown(f"**Optimal lineup projection for {my_team}:** {total_pts:.2f} pts")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.caption("Weakest starters")
+            st.dataframe(weakest_starters(starters_df, k=3), use_container_width=True)
+
+        with c2:
+            st.caption("Breakout stashes (bench)")
+            st.dataframe(breakout_stashes(my_df, weekly_df, limit=5), use_container_width=True)
+
+        with c3:
+            st.caption("FA upgrades (this week)")
+            # Reuse fa_up from above if available, else try to compute quickly
+            if "fa_up" in locals() and fa_up is not None and not fa_up.empty:
+                st.dataframe(fa_up, use_container_width=True)
+            else:
+                fa_mkt_plan = build_roster_safe_fa_pool(dp_mkt, df)
+                if fa_mkt_plan is None or fa_mkt_plan.empty:
+                    st.write("—")
+                else:
+                    fa_up_plan = top_fa_upgrades(
+                        starters_df, fa_mkt_plan, lineup_cfg, pos_prior,
+                        min_delta=0.5, max_results=6
+                    )
+                    st.dataframe(fa_up_plan, use_container_width=True)
+
+        # Prioritized checklist (bench swaps + FA adds)
+        safe_swaps = swaps if isinstance(swaps, pd.DataFrame) else pd.DataFrame()
+        safe_fa_up = fa_up if ("fa_up" in locals() and isinstance(fa_up, pd.DataFrame)) else pd.DataFrame()
+
+        plan_df = build_weekly_action_plan(safe_swaps, safe_fa_up)
+        st.dataframe(plan_df, use_container_width=True)
+
+        
+        st.caption("Prioritized actions")
+        st.dataframe(plan_df, use_container_width=True)
+
+    # --- Playoff Odds (Lineup Optimizer tab) ---
+    st.markdown("---")
+    st.subheader("Playoff Odds (this season)")
+    meta = get_league_meta(st.session_state["league_id"])
+    start_wk, end_wk, n_playoff = compute_playoff_window(meta)
+
+    if start_wk >= end_wk:
+        st.caption("Schedule window too short right now — odds will appear once there are multiple weeks left.")
+    else:
+        # Use production-based team ratings (z_prod) by default
+        odds = simulate_playoff_odds(
+            df,
+            st.session_state["league_id"],
+            start_week=start_wk,
+            end_week=end_wk,
+            playoff_teams=n_playoff,
+            metric_for_ratings="z_prod",
+            sims=1500,
+        )
+        if odds:
+            mine = float(odds.get(my_team, 0.0))
+            st.write(f"**{my_team}** playoff odds: **{mine*100:.1f}%**  "
+                     f"(window: weeks {start_wk}–{end_wk}, {n_playoff} playoff spots)")
+            # quick table
+            show = (
+                pd.Series(odds)
+                .rename("Playoff Odds")
+                .mul(100.0)
+                .round(1)
+                .sort_values(ascending=False)
+                .rename_axis("Team")
+                .to_frame()
+            )
+            st.dataframe(show, use_container_width=True)
+        else:
+            st.caption("Couldn’t compute odds — missing schedule or teams.")
+
+
+
+
+    # Done with this mode — prevent the rest of the page from running
+    st.stop()
+
+
+
+
+
 # ---------------- Filters ----------------
 st.header("Dashboards")
 f1, f2, f3 = st.columns([1, 1, 2])
@@ -788,6 +1377,9 @@ df_view = df_view[df_view["market_value"] >= q20]
 df_view = df_view[df_view["age"].fillna(99) <= max_age]
 if team_sel != "All":
     df_view = df_view[df_view["display_name"] == team_sel]
+
+
+
 
 # ---------------- Buy / Sell (with star protection in both modes) ----------------
 L, R = st.columns(2)
@@ -1029,6 +1621,7 @@ with cB2:
         pt_tbl.style.format({"Before": "{:.2f}", "After": "{:.2f}", "Δ": "{:+.2f}"}),
         use_container_width=True,
     )
+
 
 # ---------------- Free-Agent Finder (roster-safe) ----------------
 st.header("Free-Agent Finder")
