@@ -6,13 +6,34 @@ import numpy as np
 import pandas as pd
 
 # ---------- utilities ----------
+
+def _canonicalize_alias_key(nk: str) -> str:
+    # nicknames → canonical tokens
+    if not nk:
+        return nk
+    toks = nk.split()
+    s = set(toks)
+    # Marquise “Hollywood” Brown
+    if "brown" in s and "hollywood" in s:
+        toks = [t for t in toks if t != "hollywood"]
+        if "marquise" not in toks:
+            toks = ["marquise"] + toks
+    return " ".join(toks)
+
+
 def _z(s: pd.Series) -> pd.Series:
     mu = s.mean(); sd = s.std(ddof=0)
     if sd == 0 or pd.isna(sd): return s * 0
     return (s - mu) / sd
 
 def _clean_name_key(series: pd.Series) -> pd.Series:
-    return (series.astype(str).str.lower().str.replace(r"[^a-z0-9 ]", "", regex=True).str.strip())
+    # Normalize names for robust joins across Sleeper/DP/ADP
+    s = series.astype(str).str.lower()
+    s = s.str.replace(r"[^a-z0-9 ]", "", regex=True)                # drop punctuation
+    s = s.str.replace(r"\b(jr|sr|ii|iii|iv|v)\b", "", regex=True)   # drop suffixes
+    s = s.str.replace(r"\s+", " ", regex=True).str.strip()          # squeeze spaces
+    return s
+
 
 def _ewma_np(values: np.ndarray, alpha: float) -> float:
     v = np.asarray(values, dtype=float)
@@ -229,10 +250,15 @@ def attach_markets(
     out = df.copy()
     if "name_key" not in out.columns:
         out["name_key"] = _clean_name_key(out["name"])
+    # NEW: canonicalize roster keys (e.g., "hollywood brown" -> "marquise brown")
+    out["name_key"] = out["name_key"].apply(_canonicalize_alias_key)
 
     if dp_df is not None and not dp_df.empty:
         dpm = dp_df.copy()
         dpm["name_key"] = _clean_name_key(dpm["name"])
+        # NEW: canonicalize DP keys too
+        dpm["name_key"] = dpm["name_key"].apply(_canonicalize_alias_key)
+
         dpm["pos"] = dpm["pos"].astype(str)
         dpm["market_value"] = pd.to_numeric(dpm["market_value"], errors="coerce")
         out = out.merge(dpm[["name_key","pos","market_value"]], on=["name_key","pos"], how="left")
@@ -240,6 +266,9 @@ def attach_markets(
     if fp_df is not None and not fp_df.empty:
         fpm = fp_df.copy()
         fpm["name_key"] = _clean_name_key(fpm["name"])
+        # NEW: canonicalize fallback/ADP keys as well
+        fpm["name_key"] = fpm["name_key"].apply(_canonicalize_alias_key)
+
         fpm["pos"] = fpm["pos"].astype(str)
         fpm["Rank"] = pd.to_numeric(fpm.get("Rank"), errors="coerce")
         fpm["fp_value"] = (1_000.0 / (1.0 + fpm["Rank"].clip(lower=1.0))).fillna(0.0)
@@ -261,7 +290,6 @@ def attach_markets(
         scale = scale - guardrail_penalty * (1.0 - out["mv_pct"].clip(0.0, 1.0))
     out["edge_z_adj"] = out["edge_z"] * scale
 
-    # extra shrink for top-of-market players so tiny overpricing doesn't scream SELL
     elite_mask = out["mv_pct"] >= 0.90
     out.loc[elite_mask, "edge_z_adj"] *= 0.75
 
