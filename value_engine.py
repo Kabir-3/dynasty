@@ -294,4 +294,3 @@ def attach_markets(
     out.loc[elite_mask, "edge_z_adj"] *= 0.75
 
     return out
-
