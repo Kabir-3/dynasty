@@ -1,2 +1,3 @@
 nfl-data-py
 pyarrow
+fsspec
