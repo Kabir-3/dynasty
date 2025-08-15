@@ -1,0 +1,71 @@
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
+
+# ---- Python bytecode / build ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+.Python
+pip-wheel-metadata/
+pip-log.txt
+
+# ---- Virtual environments ----
+venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# ---- Environment & secrets ----
+.env
+.env.*
+.envrc
+# Streamlit local secrets/config (keep out of git)
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# ---- Caches & tooling ----
+.cache/
+pytest_cache/
+.mypy_cache/
+.pytype/
+.dmypy.json
+.pyre/
+.ipynb_checkpoints/
+coverage.xml
+.coverage
+htmlcov/
+
+# ---- Editors / IDEs ----
+.vscode/
+.idea/
+
+# ---- Node (if ever used alongside) ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---- Optional data ignores ----
+# If you keep local scratch data, put it under one of these and uncomment:
+# data/
+# tmp/
+# cache/
+# *.parquet
+# *.feather
+# *.arrow
+# *.log
+# *.sqlite
+# *.db
+
+# ---- Streamlit Cloud / misc ----
+.install/
+.build/
