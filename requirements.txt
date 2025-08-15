@@ -1,1 +1,2 @@
 nfl-data-py
+pyarrow
