@@ -305,7 +305,6 @@ def fetch_participation_parquet(season: int) -> pd.DataFrame:
     """
     import io
     import re
-    import numpy as np
     import pandas as pd
     import requests
 
@@ -708,7 +707,6 @@ def load_snap_pct_by_seasons(seasons: list[int]) -> pd.DataFrame:
     import os
     from pathlib import Path
     import pandas as pd
-    import numpy as np
     import requests
 
     def _empty_df() -> pd.DataFrame:
@@ -995,6 +993,86 @@ def normalize_name(s: pd.Series) -> pd.Series:
     return s.astype(str).str.lower().str.replace(r"[^a-z0-9 ]", "", regex=True).str.strip()
 
 def tokens_for(s: str) -> List[str]:
+    s = "".join(ch if ch.isalnum() or ch == " " else " " for ch in (s or "").lower())
+    toks = [t for t in s.split() if t and t not in {"jr", "sr", "ii", "iii", "iv", "v"}]
+    return [t for t in toks if not (len(t) == 1 and t.isalpha())]
+
+
+# ---------------- Breakout Watch (Market Edge only; no fantasy points) ----------------
+def _mk_strength_from_price_pct(price_pct_series: pd.Series) -> pd.Series:
+    p = pd.to_numeric(price_pct_series, errors="coerce").fillna(0.5).clip(0, 1)
+    return 1.0 - p  # cheaper => stronger upside in our context
+
+@st.cache_data(ttl=2 * 60 * 60, show_spinner=False)
+def _adp_frame_cached() -> Optional[pd.DataFrame]:
+    try:
+        return fetch_sleeper_adp()
+    except Exception:
+        return None
+
+def compute_breakout_watch_market_only(df_view: pd.DataFrame, top_k: int = 20) -> pd.DataFrame:
+    """
+    Inputs: df_view with ['name','pos','price_pct','age'].
+    Uses ADP to build a cross-market velocity proxy (DP/market vs ADP strength).
+    """
+    if df_view is None or df_view.empty:
+        return df_view.iloc[0:0]
+    x = df_view.copy()
+
+    # Clean basics
+    for c in ["name","pos"]:
+        if c not in x.columns: x[c] = ""
+    x["price_pct"] = pd.to_numeric(x.get("price_pct", None), errors="coerce").fillna(0.5).clip(0,1)
+    x["age"] = pd.to_numeric(x.get("age", None), errors="coerce")
+
+    # (1) Undervaluation
+    underval = (1.0 - x["price_pct"]).clip(0, 1)
+
+    # (2) Velocity proxy via ADP
+    adp = _adp_frame_cached()
+    if adp is not None and not adp.empty:
+        try:
+            adp2 = adp.copy()
+            col_name = "name" if "name" in adp2.columns else ("Name" if "Name" in adp2.columns else None)
+            if col_name is None:
+                x["adp_strength"] = pd.NA
+            else:
+                adp2["name_key"] = normalize_name(adp2[col_name])
+                x["name_key"] = normalize_name(x["name"])
+                r = pd.to_numeric(adp2.get("Rank"), errors="coerce")
+                maxr = float(r.max()) if r.notna().any() else 300.0
+                adp2["adp_strength"] = (maxr - r + 1.0) / maxr
+                adp2 = adp2[["name_key","adp_strength"]].dropna()
+                x = x.merge(adp2, on="name_key", how="left")
+        except Exception:
+            x["adp_strength"] = pd.NA
+    else:
+        x["adp_strength"] = pd.NA
+
+    dp_strength = _mk_strength_from_price_pct(x["price_pct"])
+    vel = (dp_strength - pd.to_numeric(x["adp_strength"], errors="coerce").fillna(0.5)).clip(lower=0.0, upper=1.0)
+
+    # (3) Age/experience bonus
+    pos = x["pos"].astype(str).str.upper()
+    age = x["age"]
+    age_bonus = (
+        ((pos.isin(["WR","RB","TE"])) & (age <= 24)).astype(float) * 1.0 +
+        ((pos == "QB") & (age <= 25)).astype(float) * 0.8
+    )
+    age_bonus = (age_bonus / 1.0).clip(0,1)
+
+    x["breakout_score"] = (
+        0.45 * underval +
+        0.35 * vel +
+        0.20 * age_bonus
+    ).astype(float)
+
+    keep_cols = [c for c in ["name","pos","age","price_pct","adp_strength","breakout_score"] if c in x.columns]
+    out = (x.sort_values("breakout_score", ascending=False)[keep_cols]
+             .drop_duplicates(subset=["name","pos"], keep="first")
+             .head(top_k)
+             .reset_index(drop=True))
+    return out
     s = "".join(ch if ch.isalnum() or ch == " " else " " for ch in (s or "").lower())
     toks = [t for t in s.split() if t and t not in {"jr", "sr", "ii", "iii", "iv", "v"}]
     return [t for t in toks if not (len(t) == 1 and t.isalpha())]
@@ -2739,7 +2817,81 @@ if mode == "Lineup Optimizer":
                     )
                     st.dataframe(fa_up_plan, use_container_width=True)
 
-        # Prioritized checklist (bench swaps + FA adds)
+        # 
+        # === Cuttable Candidates (bench cleanup) ===
+        try:
+            st.markdown("**Cuttable Candidates**")
+            base = my_df.copy()
+            # Prefer per-week projection if present; else use overall projected_points
+            proj_col = "proj_week" if "proj_week" in base.columns else ("projected_points" if "projected_points" in base.columns else None)
+            if proj_col is None:
+                base["proj_use"] = 0.0
+            else:
+                base["proj_use"] = pd.to_numeric(base[proj_col], errors="coerce").fillna(0.0)
+
+            # Recent PPG from weekly_df (last 3 games)
+            if weekly_df is not None and not weekly_df.empty:
+                w = weekly_df.copy()
+                for col in ["player_id","name_key","name","pos","points","week"]:
+                    if col not in w.columns:
+                        w[col] = "" if col in ["name","name_key","pos","player_id"] else 0.0
+                if "name_key" not in base.columns and "name" in base.columns:
+                    base["name_key"] = normalize_name(base["name"])
+                w = w.sort_values(["player_id","name_key","week"])
+                # Build a simple (last-3) PPG by player_id if available else by name_key+pos
+                if "player_id" in w.columns and "player_id" in base.columns:
+                    g = w.groupby("player_id")["points"].apply(lambda s: pd.Series(s.tail(3).mean()))
+                    base = base.merge(g.rename("ppg_recent").reset_index(), on="player_id", how="left")
+                else:
+                    g = w.groupby(["name_key","pos"])["points"].apply(lambda s: pd.Series(s.tail(3).mean()))
+                    base = base.merge(g.rename("ppg_recent").reset_index(), on=["name_key","pos"], how="left")
+            if "ppg_recent" not in base.columns:
+                base["ppg_recent"] = 0.0
+            base["ppg_recent"] = pd.to_numeric(base["ppg_recent"], errors="coerce").fillna(0.0)
+
+            # Price percentile (if missing, fallback mid)
+            price = pd.to_numeric(base.get("price_pct", 0.5), errors="coerce").fillna(0.5)
+            base["price_pct"] = price
+
+            # Starter mask (protect starters)
+            starter_names = set(starters_df["name"].astype(str)) if "starters_df" in locals() else set()
+            base["is_starter"] = base["name"].astype(str).isin(starter_names)
+
+            # Pos-wise ranks for projection and recent ppg (lower rank => more cuttable)
+            base["_proj_rank_pct"] = base.groupby("pos")["proj_use"].rank(pct=True, method="average").fillna(1.0)
+            base["_ppg_rank_pct"]  = base.groupby("pos")["ppg_recent"].rank(pct=True, method="average").fillna(1.0)
+
+            # Bench rank within position
+            base["_bench_rank_pos"] = base.groupby("pos")["proj_use"].rank(ascending=False, method="first")
+
+            # Cut score: higher = more cuttable
+            base["cut_score"] = (1.0 - base["_proj_rank_pct"]) * 0.45 \
+                          + (1.0 - base["_ppg_rank_pct"])  * 0.35 \
+                          + (1.0 - base["price_pct"])       * 0.20 \
+                          + (base["_bench_rank_pos"] > 4)   * 0.10 \
+                          - (base["is_starter"])            * 0.60
+
+            # Filter: not starters, low price, reasonable bench depth
+            cand = base[~base["is_starter"]].copy()
+            cand = cand[cand["price_pct"] <= 0.40]  # don't recommend cutting assets
+
+            # Reasons
+            def reason_row(r):
+                bits = []
+                if r["_proj_rank_pct"] <= 0.25: bits.append("low proj")
+                if r["_ppg_rank_pct"] <= 0.25:  bits.append("cold")
+                if r["price_pct"] <= 0.25:      bits.append("no market")
+                if r["_bench_rank_pos"] > 4:    bits.append("deep bench")
+                return ", ".join(bits) or "depth"
+            cand["reason"] = cand.apply(reason_row, axis=1)
+
+            keep_cols = [c for c in ["name","pos","team","age","proj_use","ppg_recent","price_pct","_bench_rank_pos","cut_score","reason"] if c in cand.columns]
+            cut_show = cand.sort_values("cut_score", ascending=False)[keep_cols].head(10)
+            st.dataframe(cut_show.round(3), use_container_width=True)
+            st.caption("Heuristic: protects starters and any player with meaningful market value; scores low projection, cold recent form, and deep positional bench.")
+        except Exception as e:
+            st.caption(f"Cut list build failed: {type(e).__name__}: {e}")
+# Prioritized checklist (bench swaps + FA adds)
         safe_swaps = swaps if isinstance(swaps, pd.DataFrame) else pd.DataFrame()
         safe_fa_up = fa_up if ("fa_up" in locals() and isinstance(fa_up, pd.DataFrame)) else pd.DataFrame()
 
@@ -2892,79 +3044,8 @@ with R:
     if p2 != "—":
         st.info(why_player(sell_tbl[sell_tbl["name"] == p2].iloc[0]))
 
-# === Win-Now: Snap / Usage Uptick Watchlist ===
-if mode.startswith("Win"):
-    st.markdown("---")
-    st.subheader("Snap / Usage Uptick Watchlist")
 
-    # We need weekly data to compute recent usage
-    if weekly_df is None or weekly_df.empty:
-        st.caption("Uptick watch needs weekly data (snaps/touches/points). Pick a season + through week above.")
-    else:
-        # If you haven't already attached uptick fields earlier, compute them on the fly here
-        if "uptick_score" not in df.columns:
-            upt = compute_uptick_scores(df, weekly_df)
-            for c in upt.columns:
-                df[c] = upt[c]
-
-        # Controls (keys are Win-Now specific to avoid conflicts)
-        u1, u2, u3 = st.columns([1, 1, 1])
-        with u1:
-            # Under-25: use strict "< 25" per your last message
-            age_max = st.slider("Max age (strictly under)", 22, 28, 25, 1, key="wn_upt_age")
-        with u2:
-            min_score = st.slider("Min uptick score (z)", -1.0, 2.0, 0.5, 0.1, key="wn_upt_min")
-        with u3:
-            price_cap = st.slider("Max price percentile", 0.30, 0.95, 0.70, 0.05, key="wn_upt_price")
-
-        # Filters
-        young = df["age"].fillna(99) < age_max       # < 25
-        affordable = df["price_pct"].fillna(1.0) <= price_cap
-        risers = df["watch_flag"].fillna(False)
-
-
-        active_usage = (df["usage_recent"].fillna(0) > 0) | (df["usage_prev"].fillna(0) > 0)
-
-
-        watch = df[young & affordable & risers & active_usage].copy().sort_values(
-            ["uptick_score", "price_pct"], ascending=[False, True]
-)
-
-        
-
-        # Show last and previous snap% for visibility
-    if weekly_df is not None and ("player_id" in weekly_df.columns):
-        wd = weekly_df.copy()
-        wd["player_id"] = wd["player_id"].astype(str)
-        wd["snap_pct"] = pd.to_numeric(pd.Series(wd.get("snap_pct")), errors="coerce").fillna(0.0)
-
-
-        last_snap = (wd.sort_values("week").groupby("player_id")["snap_pct"].last())
-        prev_snap = (wd.sort_values("week").groupby("player_id")["snap_pct"]
-                    .apply(lambda s: s.iloc[-2] if len(s) >= 2 else np.nan))
-
-        df["snap_pct_now"]  = df["player_id"].astype(str).map(last_snap)
-        df["snap_pct_prev"] = df["player_id"].astype(str).map(prev_snap)
-        df["snap_delta"]    = df["snap_pct_now"] - df["snap_pct_prev"]
-
-        watch["snap_pct_now"]  = watch["player_id"].astype(str).map(last_snap)
-        watch["snap_pct_prev"] = watch["player_id"].astype(str).map(prev_snap)
-        watch["snap_delta"]    = watch["snap_pct_now"] - watch["snap_pct_prev"]
-
-
-        # Columns to show
-        show_cols = [
-            "display_name", "name", "pos", "age", "team",
-            "snap_pct_prev", "snap_pct_now", "snap_delta",
-            "usage_prev", "usage_recent", "usage_delta", "delta_pct",
-            "slope4", "price_pct"
-        ]
-        show_cols = [c for c in show_cols if c in watch.columns]
-
-        st.dataframe(watch[show_cols].round(3), use_container_width=True)
-        st.caption("Usage = snaps if available, else touches (rush+targets), else a points proxy. "
-                   "Uptick = last 2 vs prior 2 + short-term slope. Under-25 only.")
-
+# (Uptick Watchlist removed by request)
 
 # ---------------- Player Lookup (inline weekly chart) ----------------
 st.header("Player Lookup")
@@ -3225,3 +3306,23 @@ else:
     st.dataframe(fa_view[["name", "pos", "true_value", "market_value", "edge", "edge_z_adj"]], use_container_width=True)
 
 st.caption("Tip: in **Win-Now**, pick a past season + week range, then use Player Lookup to chart points.")
+
+
+# ================= Market Edge — Breakout Watch (final render) =================
+try:
+    if mode.startswith("Market"):
+        st.subheader("Breakout Watch (Market Edge)")
+        if 'df_view' in locals() and df_view is not None and not df_view.empty:
+            bw_tbl = compute_breakout_watch_market_only(df_view, top_k=20)
+            if bw_tbl is None or bw_tbl.empty:
+                st.caption("No breakout candidates yet — adjust filters or refresh market.")
+            else:
+                bt = bw_tbl.copy()
+                if "price_pct" in bt.columns:
+                    import pandas as _pd
+                    bt["price_pct"] = (_pd.to_numeric(bt["price_pct"], errors="coerce")*100).round(1)
+                st.dataframe(bt, use_container_width=True)
+        else:
+            st.caption("Market Edge view not ready yet.")
+except Exception as _e:
+    st.caption(f"Breakout Watch error: {type(_e).__name__}: {_e}")
